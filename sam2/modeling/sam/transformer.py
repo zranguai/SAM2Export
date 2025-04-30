@@ -14,8 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
-from sam2.modeling.position_encoding import apply_rotary_enc, compute_axial_cis
-from sam2.modeling.position_encoding import apply_rotary_matenc, get_rotation_matrices
+from sam2.modeling.position_encoding import compute_axial_rope_cos_sin, apply_rotary_emb
 from sam2.modeling.sam2_utils import MLP
 from sam2.utils.misc import get_sdpa_settings
 
@@ -291,95 +290,64 @@ class Attention(nn.Module):
 
 
 class RoPEAttention(Attention):
-    """Attention with rotary position encoding."""
-
     def __init__(
         self,
         *args,
         rope_theta=10000.0,
-        # whether to repeat q rope to match k length
-        # this is needed for cross-attention to memories
         rope_k_repeat=False,
-        feat_sizes=(32, 32),  # [w, h] for stride 16 feats at 512 resolution
+        feat_sizes=(64, 64),
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-
-        self.compute_cis = partial(
-            compute_axial_cis, dim=self.internal_dim // self.num_heads, theta=rope_theta
-        )
-        freqs_cis = self.compute_cis(end_x=feat_sizes[0], end_y=feat_sizes[1])
-        self.freqs_cis = freqs_cis
+        self.rope_theta = rope_theta
+        self.feat_sizes = feat_sizes
         self.rope_k_repeat = rope_k_repeat
+        self._cached_shape = None
+        self._cached_cos_sin = None
 
-        if USE_MAT_ROTARY_ENC:
-            rotmats = get_rotation_matrices(dim=self.internal_dim // self.num_heads, end_x=feat_sizes[0], end_y=feat_sizes[1], theta=rope_theta)
-            self.rotmats = rotmats
-            self.rope_theta = rope_theta
+    def get_cos_sin(self, seq_len, device, dtype):
+        # 缓存
+        if self._cached_shape == (seq_len, device, dtype):
+            return self._cached_cos_sin
+        w = h = int(math.sqrt(seq_len))
+        cos, sin = compute_axial_rope_cos_sin(
+            dim=self.internal_dim // self.num_heads,
+            end_x=w, end_y=h, theta=self.rope_theta
+        )
+        cos, sin = cos.to(device=device, dtype=dtype), sin.to(device=device, dtype=dtype)
+        self._cached_shape = (seq_len, device, dtype)
+        self._cached_cos_sin = (cos, sin)
+        return cos, sin
 
-    def forward(
-        self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0
-    ) -> Tensor:
-        # Input projections
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 64) -> Tensor:
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
-
-        # Separate into heads
         q = self._separate_heads(q, self.num_heads)
         k = self._separate_heads(k, self.num_heads)
         v = self._separate_heads(v, self.num_heads)
 
-        # Apply rotary position encoding
-        w = h = math.sqrt(q.shape[-2])
-
-        self.freqs_cis = self.freqs_cis.to(q.device)
-        if self.freqs_cis.shape[0] != q.shape[-2]:
-            self.freqs_cis = self.compute_cis(end_x=w, end_y=h).to(q.device)
-
-        if USE_MAT_ROTARY_ENC:
-            self.rotmats = self.rotmats.to(q.device)
-            if self.rotmats.shape[0] != q.shape[-2]:
-                self.rotmats = get_rotation_matrices(dim=self.internal_dim // self.num_heads, end_x=w, end_y=h, theta=self.rope_theta)
-
-        if q.shape[-2] != k.shape[-2]:
+        seq_len = q.shape[-2]
+        cos, sin = self.get_cos_sin(seq_len, q.device, q.dtype)
+        # q: [B, n_head, seq_len, head_dim]
+        q = apply_rotary_emb(q, cos, sin)
+        if k.shape[-2] != q.shape[-2]:
             assert self.rope_k_repeat
-
-        num_k_rope = k.size(-2) - num_k_exclude_rope
-        if USE_MAT_ROTARY_ENC:
-            q, k[:, :, :num_k_rope] = apply_rotary_matenc(
-                q,
-                k[:, :, :num_k_rope],
-                rotmats=self.rotmats,
-                repeat_freqs_k=self.rope_k_repeat,
-            )
+            # repeat cos/sin
+            repeat = k.shape[-2] // q.shape[-2]
+            cos_k = cos.repeat(repeat, 1)
+            sin_k = sin.repeat(repeat, 1)
         else:
-            q, k[:, :, :num_k_rope] = apply_rotary_enc(
-                q,
-                k[:, :, :num_k_rope],
-                freqs_cis=self.freqs_cis,
-                repeat_freqs_k=self.rope_k_repeat,
-            )
+            cos_k, sin_k = cos, sin
+        num_k_rope = k.size(-2) - num_k_exclude_rope
+        if num_k_exclude_rope > 0:
+            k_rope = apply_rotary_emb(k[:, :, :num_k_rope], cos_k[:num_k_rope], sin_k[:num_k_rope])
+            k = torch.cat([k_rope, k[:, :, num_k_rope:]], dim=-2)
+        else:
+            k = apply_rotary_emb(k, cos_k, sin_k)
 
         dropout_p = self.dropout_p if self.training else 0.0
-        # Attention
-        #try:
-        #    with sdp_kernel_context(dropout_p):
-        #        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        #except Exception as e:
-        if True:
-            # Fall back to all kernels if the Flash attention kernel fails
-            #warnings.warn(
-            #    f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
-            #    f"kernels for scaled_dot_product_attention (which may have a slower speed).",
-            #    category=UserWarning,
-            #    stacklevel=2,
-            #)
-            global ALLOW_ALL_KERNELS
-            ALLOW_ALL_KERNELS = True
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         out = self._recombine_heads(out)
         out = self.out_proj(out)
-
         return out
