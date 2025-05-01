@@ -163,62 +163,47 @@ class PositionEmbeddingRandom(nn.Module):
 # 2. https://github.com/naver-ai/rope-vit
 # 3. https://github.com/lucidrains/rotary-embedding-torch
 
-
-def init_t_xy(end_x: int, end_y: int):
-    t = torch.arange(end_x * end_y, dtype=torch.float32)
+def init_t_xy(end_x: int, end_y: int, device=None):
+    t = torch.arange(end_x * end_y, dtype=torch.float32, device=device)
     t_x = (t % end_x).float()
     t_y = torch.div(t, end_x, rounding_mode="floor").float()
     return t_x, t_y
 
-
-def compute_axial_cis(dim: int, end_x: int, end_y: int, theta: float = 10000.0):
-    freqs_x = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
-    freqs_y = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
-
+def compute_axial_rope_cos_sin(dim: int, end_x: int, end_y: int, theta: float = 10000.):
+    # dim: 需要能被4整除
+    assert dim % 2 == 0
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     t_x, t_y = init_t_xy(end_x, end_y)
-    freqs_x = torch.outer(t_x, freqs_x)
-    freqs_y = torch.outer(t_y, freqs_y)
-    freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
-    freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
-    return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
+    freqs_x = torch.outer(t_x, freqs)  # [end_x*end_y, dim//2]
+    freqs_y = torch.outer(t_y, freqs)  # [end_x*end_y, dim//2]
+    # 拼在一起
+    freqs = torch.cat([freqs_x, freqs_y], dim=-1)  # [seq_len, dim]
+    cos = freqs.cos()
+    sin = freqs.sin()
+    return cos, sin  # [seq_len, dim]
 
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+def reshape_for_broadcast(param, x):
+    # param: [seq_len, dim], x: [..., seq_len, dim]
+    # reshape param为[1, ..., seq_len, dim]
     ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[-2], x.shape[-1])
-    shape = [d if i >= ndim - 2 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+    shape = [1]*(ndim-2) + list(param.shape)
+    return param.view(*shape)
 
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    # x: [B, n_head, seq_len, head_dim]  head_dim必须是偶数
+    # cos/sin: [seq_len, head_dim]
+    # 广播到x形状
+    while cos.ndim < x.ndim:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    cos, sin = cos[..., ::2], sin[..., ::2]
+    x_out_even = x1 * cos - x2 * sin
+    x_out_odd  = x1 * sin + x2 * cos
+    x_out = torch.stack([x_out_even, x_out_odd], dim=-1)
+    x_out = x_out.flatten(-2)  # 恢复到原始最后一维
+    return x_out
 
-def apply_rotary_enc(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    repeat_freqs_k: bool = False,
-):
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = (
-        torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        if xk.shape[-2] != 0
-        else None
-    )
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    if xk_ is None:
-        # no keys to rotate, due to dropout
-        return xq_out.type_as(xq).to(xq.device), xk
-    # repeat freqs along seq_len dim to match k seq_len
-    if repeat_freqs_k:
-        r = xk_.shape[-2] // xq_.shape[-2]
-        if freqs_cis.is_cuda:
-            freqs_cis = freqs_cis.repeat(*([1] * (freqs_cis.ndim - 2)), r, 1)
-        else:
-            # torch.repeat on complex numbers may not be supported on non-CUDA devices
-            # (freqs_cis has 4 dims and we repeat on dim 2) so we use expand + flatten
-            freqs_cis = freqs_cis.unsqueeze(2).expand(-1, -1, r, -1, -1).flatten(2, 3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq).to(xq.device), xk_out.type_as(xk).to(xk.device)
 
 
 # Matrix version of rotary enc
