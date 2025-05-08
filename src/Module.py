@@ -123,7 +123,6 @@ class ImageDecoder(nn.Module):
         self,
         point_coords: torch.Tensor, # [num_labels,num_points,2]
         point_labels: torch.Tensor, # [num_labels,num_points]
-        frame_size: torch.Tensor,   # [2]
         image_embed: torch.Tensor,  # [1,256,64,64]
         high_res_feats_0: torch.Tensor, # [1, 32, 256, 256]
         high_res_feats_1: torch.Tensor, # [1, 64, 128, 128]
@@ -156,7 +155,7 @@ class ImageDecoder(nn.Module):
         # 还原到原图大小
         pred_mask = torch.nn.functional.interpolate(
             low_res_masks,
-            size=(frame_size[0], frame_size[1]),
+            size=(1024, 1024),
             mode="bilinear",
             align_corners=False,
         )

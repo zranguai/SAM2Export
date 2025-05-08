@@ -53,7 +53,7 @@ def export_memory_attention(model,onnx_path):
         "num_obj_ptr":{0: "num"},
         "memory_0": {0: "num"},
         "memory_1": {0: "buff_size"},
-        "memory_pos_embed": {0: "buff_size"}
+        "memory_pos_embed": {0: "dynamic"}
     }
     torch.onnx.export(
         model,
@@ -86,12 +86,11 @@ def export_image_decoder(model,onnx_path):
     out = model(
         point_coords = point_coords,
         point_labels = point_labels,
-        frame_size = frame_size,
         image_embed = image_embed,
         high_res_feats_0 = high_res_feats_0,
         high_res_feats_1 = high_res_feats_1
     )
-    input_name = ["point_coords","point_labels","frame_size","image_embed","high_res_feats_0","high_res_feats_1"]
+    input_name = ["point_coords","point_labels","image_embed","high_res_feats_0","high_res_feats_1"]
     output_name = ["obj_ptr","mask_for_mem","pred_mask"]
     dynamic_axes = {
         "point_coords":{0: "num_labels",1:"num_points"},
@@ -99,7 +98,7 @@ def export_image_decoder(model,onnx_path):
     }
     torch.onnx.export(
         model,
-        (point_coords,point_labels,frame_size,image_embed,high_res_feats_0,high_res_feats_1),
+        (point_coords,point_labels,image_embed,high_res_feats_0,high_res_feats_1),
         onnx_path+"image_decoder.onnx",
         export_params=True,
         opset_version=17,
